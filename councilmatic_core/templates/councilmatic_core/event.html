@@ -7,7 +7,7 @@
     <div class="row-fluid">
         <div class="col-sm-8">
             <br/>
-            <p><a href='/events/'><i class="fa fa-angle-double-left" aria-hidden="true"></i> back to {{ CITY_VOCAB.EVENTS }}</a></p>
+            <p><a href='/events/'><i class="fa fa-angle-double-left" aria-hidden="true"></i> {{ CITY_VOCAB.EVENTS }}</a></p>
             <h1>{{event.name}}</h1>
             <p>{{event.description}}</p>
 
@@ -18,7 +18,7 @@
             </p>
 
             <p class="small">
-                <a href='{{event.source_url}}' title='View on the {{CITY_VOCAB.SOURCE}} website' target="_blank">
+                <a href='{{event.source_url}}' title='View on the {{CITY_VOCAB.SOURCE}} website' target="_blank" rel="nofollow">
                     <i class='fa fa-fw fa-external-link'></i>
                     View on the {{CITY_VOCAB.SOURCE}} website
                 </a>
@@ -83,7 +83,7 @@
       },
       "name": "{{event.name}}",
       "startDate": "{{ event.start_time.isoformat }}",
-      "url" : "{{ event.source_url }}"
+      "url" : "{{SITE_META.site_url}}/event/{{event.slug}}"
     }
     </script>
 

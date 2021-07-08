@@ -7,6 +7,7 @@ import pytz
 from django.db import models
 from django.core.exceptions import ImproperlyConfigured
 from django.conf import settings
+from django.contrib.postgres.fields.jsonb import JSONField
 from django.core.urlresolvers import reverse
 from django.core.urlresolvers import NoReverseMatch
 from django.utils import timezone
@@ -58,6 +59,16 @@ def override_relation(base_model):
 def get_uuid():
     import uuid
     return str(uuid.uuid4())
+
+
+class Jurisdiction(models.Model):
+    ocd_id = models.CharField(max_length=100, unique=True, primary_key=True)
+    name = models.CharField(max_length=300)
+    classification = models.CharField(max_length=50)
+    url = models.CharField(max_length=2000)
+
+    def __str__(self):
+        return '{0} ({1})'.format(self.name, self.ocd_id)
 
 
 class Person(models.Model):
@@ -170,7 +181,6 @@ class Bill(models.Model):
     classification = models.CharField(max_length=100)
     source_url = models.CharField(max_length=255)
     source_note = models.CharField(max_length=255, blank=True)
-    subject = models.CharField(max_length=255, blank=True, null=True)
 
     _from_organization = models.ForeignKey('Organization',
                                            related_name='bills',
@@ -178,6 +188,7 @@ class Bill(models.Model):
                                            db_column='from_organization_id')
 
     full_text = models.TextField(blank=True, null=True)
+    html_text = models.TextField(blank=True, null=True)
     ocr_full_text = models.TextField(blank=True, null=True)
     abstract = models.TextField(blank=True, null=True)
     last_action_date = models.DateTimeField(default=None, null=True)
@@ -189,6 +200,7 @@ class Bill(models.Model):
                                              db_column='legislative_session_id')
 
     slug = models.CharField(max_length=255, unique=True)
+    restrict_view = models.BooleanField(default=False)
 
     @property
     def from_organization(self):
@@ -398,6 +410,11 @@ class Organization(models.Model):
     source_url = models.CharField(max_length=255, blank=True, null=True)
     slug = models.CharField(max_length=255, unique=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    jurisdiction = models.ForeignKey(Jurisdiction,
+                                     related_name='organizations',
+                                     on_delete=models.PROTECT,
+                                     null=True)
 
     @property
     def parent(self):
@@ -622,6 +639,7 @@ class Membership(models.Model):
     start_date = models.DateField(default=None, null=True)
     end_date = models.DateField(default=None, null=True)
     updated_at = models.DateTimeField(auto_now=True)
+    extras = JSONField(default=dict)
 
     @property
     def organization(self):
@@ -670,11 +688,11 @@ class Event(models.Model):
     status = models.CharField(max_length=100)
     location_name = models.CharField(max_length=255)
     location_url = models.CharField(max_length=255, blank=True)
-    media_url = models.CharField(max_length=555, null=True, default=None)
     source_url = models.CharField(max_length=255)
     source_note = models.CharField(max_length=255, blank=True)
     slug = models.CharField(max_length=255, unique=True)
     updated_at = models.DateTimeField(auto_now=True)
+    extras = JSONField(default=dict)
 
     @property
     def event_page_url(self):
@@ -745,11 +763,23 @@ class EventAgendaItem(models.Model):
     note = models.CharField(max_length=255, null=True)
     notes = models.CharField(max_length=255, null=True)
     updated_at = models.DateTimeField(auto_now=True)
+    plain_text = models.TextField(null=True)
 
     def __init__(self, *args, **kwargs):
         super(EventAgendaItem, self).__init__(*args, **kwargs)
         self.event = override_relation(self.event)
         self.bill = override_relation(self.bill)
+
+
+class EventMedia(models.Model):
+    event = models.ForeignKey('Event', related_name='media_urls')
+    url = models.CharField(max_length=555)
+    note = models.CharField(max_length=255, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __init__(self, *args, **kwargs):
+        super(EventMedia, self).__init__(*args, **kwargs)
+        self.event = override_relation(self.event)
 
 
 class Document(models.Model):
@@ -786,3 +816,13 @@ class LegislativeSession(models.Model):
     jurisdiction_ocd_id = models.CharField(max_length=255)
     name = models.CharField(max_length=255)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class Subject(models.Model):
+    bill = models.ForeignKey('Bill', related_name='subjects')
+    subject = models.CharField(max_length=255)
+
+
+class RelatedBill(models.Model):
+    related_bill_identifier = models.CharField(max_length=100)
+    central_bill = models.ForeignKey('Bill', related_name='related_bills')

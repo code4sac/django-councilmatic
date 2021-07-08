@@ -3,7 +3,8 @@ import json
 import itertools
 from operator import attrgetter
 import urllib
-from datetime import date, timedelta, datetime
+import requests
+from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 from dateutil import parser
 
@@ -34,12 +35,20 @@ app_timezone = pytz.timezone(settings.TIME_ZONE)
 class CouncilmaticFacetedSearchView(FacetedSearchView):
 
     def extra_context(self):
+        # Raise an error if Councilmatic cannot connect to Solr.
+        # Most likely, Solr is down and needs restarting.
+        try:
+            solr_url = settings.HAYSTACK_CONNECTIONS['default']['URL']
+            requests.get(solr_url)
+        except requests.ConnectionError:
+            raise Exception("ConnectionError: Unable to connect to Solr at {}. Is Solr running?".format(solr_url))
 
         extra = super(FacetedSearchView, self).extra_context()
         extra['request'] = self.request
         extra['facets'] = self.results.facet_counts()
 
         q_filters = ''
+
         url_params = [(p, val) for (p, val) in self.request.GET.items(
         ) if p != 'page' and p != 'selected_facets' and p != 'amp' and p != '_']
         selected_facet_vals = self.request.GET.getlist('selected_facets')
@@ -96,7 +105,6 @@ class CouncilmaticSearchForm(FacetedSearchForm):
 
     def no_query_found(self):
 
-        # return self.searchqueryset.order_by('-last_action_date').all()
         return self.searchqueryset.all()
 
 # This is used by a context processor in settings.py to render these variables
@@ -119,7 +127,8 @@ def city_context(request):
         'MAP_CONFIG',
         'ANALYTICS_TRACKING_CODE',
         'ABOUT_BLURBS',
-        'USING_NOTIFICATIONS'
+        'USING_NOTIFICATIONS',
+        'GOOGLE_API_KEY'
     ]
 
     city_context = {s: getattr(settings, s, None) for s in relevant_settings}
@@ -136,27 +145,7 @@ class IndexView(TemplateView):
     def get_context_data(self, **kwargs):
         context = super(IndexView, self).get_context_data(**kwargs)
 
-        recently_passed = []
-        # go back in time at 10-day intervals til you find 3 passed bills
-        for i in range(0, -100, -10):
-
-            today = timezone.now()
-
-            begin = today + timedelta(days=i)
-            end = today + timedelta(days=i - 10)
-
-            leg_in_range = self.bill_model.objects\
-                .exclude(last_action_date=None)\
-                .filter(last_action_date__lte=begin)\
-                .filter(last_action_date__gt=end)\
-                .order_by('-last_action_date')
-            passed_in_range = [l for l in leg_in_range
-                               if l.inferred_status == 'Passed']
-
-            recently_passed.extend(passed_in_range)
-            if len(recently_passed) >= 3:
-                recently_passed = recently_passed[:3]
-                break
+        recently_passed = self.find_recently_passed(self.bill_model)
 
         upcoming_meetings = list(
             self.event_model.upcoming_committee_meetings())
@@ -176,6 +165,14 @@ class IndexView(TemplateView):
         Override this in custom subclass to add more context variables if needed.
         """
         return {}
+
+    def find_recently_passed(self, bill_model):
+        recently_passed = []
+        # Do you want to show recently passed bills? CUSTOMIZE FOR COUNCILMATIC.
+        # Otherwise avoid any unnecessary iterative processes when loading the index.
+        # Example: https://github.com/datamade/django-councilmatic/blob/154028d1bc4639fa1ec1af75139cab544abdd315/councilmatic_core/views.py#L139
+
+        return recently_passed
 
 
 class AboutView(TemplateView):
@@ -479,13 +476,13 @@ class EventsView(ListView):
         else:
             # Upcoming events for the current month.
             upcoming_events = Event.objects.filter(start_time__gt=timezone.now())\
-                .filter(start_time__lt=datetime(timezone.now().year, timezone.now().month + 1, 1))\
+                .filter(start_time__lt=(timezone.now() + relativedelta(months=1)))\
                 .order_by('start_time')
 
             if len(upcoming_events) < 3:
                 # Upcoming events for the next month, plus two or three from previous months.
                 upcoming_events = Event.objects.filter(start_time__gt=timezone.now())\
-                    .filter(start_time__lt=datetime(timezone.now().year, timezone.now().month + 2, 1))\
+                    .filter(start_time__lt=(timezone.now() + relativedelta(months=2)))\
                     .order_by('start_time')
 
             org_upcoming_events = []

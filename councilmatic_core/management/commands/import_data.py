@@ -7,6 +7,7 @@ import os
 import sys
 import logging
 import logging.config
+import shutil
 
 import requests
 import pytz
@@ -16,6 +17,8 @@ import sqlalchemy as sa
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 from dateutil import parser as date_parser
+
+from raven.contrib.django.raven_compat.models import client
 
 from django.core.management.base import BaseCommand
 from django.core.exceptions import ImproperlyConfigured
@@ -28,7 +31,7 @@ from django.db.models import Max
 from councilmatic_core.models import Person, Bill, Organization, Action, ActionRelatedEntity, \
     Post, Membership, Sponsorship, LegislativeSession, \
     Document, BillDocument, Event, EventParticipant, EventDocument, \
-    EventAgendaItem
+    EventAgendaItem, Jurisdiction
 
 
 logging.config.dictConfig(settings.LOGGING)
@@ -38,18 +41,12 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 session = requests.Session()
 
-for configuration in ['OCD_JURISDICTION_ID',
-                      'HEADSHOT_PATH',
-                      'LEGISLATIVE_SESSIONS'
-                      ]:
+for configuration in ['OCD_JURISDICTION_IDS',
+                      'HEADSHOT_PATH',]:
 
     if not hasattr(settings, configuration):
         raise ImproperlyConfigured(
             'You must define {0} in settings.py'.format(configuration))
-
-if not (hasattr(settings, 'OCD_CITY_COUNCIL_ID') or hasattr(settings, 'OCD_CITY_COUNCIL_NAME')):
-    raise ImproperlyConfigured(
-        'You must define a OCD_CITY_COUNCIL_ID or OCD_CITY_COUNCIL_NAME in settings.py')
 
 app_timezone = pytz.timezone(settings.TIME_ZONE)
 
@@ -74,12 +71,14 @@ DEBUG = settings.DEBUG
 
 class Command(BaseCommand):
     help = 'loads in data from the open civic data API'
-    update_since = None
 
     def add_arguments(self, parser):
         parser.add_argument(
             '--endpoints',
-            help="a specific endpoint to load data from",
+            help='Indicates a specific endpoint from which to load data.'
+                 'Be aware! Data about people depends on data about organizations,'
+                 'and so, the people endpoint should not be run without the organization endpoint,'
+                 'i.e., --endpoints=organizations,people',
             default='organizations,people,bills,events')
 
         parser.add_argument('--delete',
@@ -100,68 +99,70 @@ class Command(BaseCommand):
                             default=False,
                             help='Only download OCD data')
 
-        parser.add_argument('--no_index',
+        parser.add_argument('--keep_downloads',
                             action='store_true',
-                            default=False,
-                            help='Only download OCD data')
-
+                            help='Preserve JSON files in downloads directory')
 
     def handle(self, *args, **options):
+        self.update_since = None
 
         self.connection = engine.connect()
 
-        self.downloads_folder = 'downloads'
         self.this_folder = os.path.abspath(os.path.dirname(__file__))
-
-        self.organizations_folder = os.path.join(self.downloads_folder, 'organizations')
-        self.posts_folder = os.path.join(self.downloads_folder, 'posts')
-        self.bills_folder = os.path.join(self.downloads_folder, 'bills')
-        self.people_folder = os.path.join(self.downloads_folder, 'people')
-        self.events_folder = os.path.join(self.downloads_folder, 'events')
 
         if options['update_since']:
             self.update_since = date_parser.parse(options['update_since'])
 
         endpoints = options['endpoints'].split(',')
+        if 'people' in endpoints and 'organizations' not in endpoints:
+            self.log_message('Huh? Those endpoints do not look right.', style='ERROR')
+            raise ValueError('You must import organization data to import people data: please include both endpoints')
 
-        for endpoint in endpoints:
+        for jurisdiction_id in settings.OCD_JURISDICTION_IDS:
 
-            if endpoint not in ['organizations', 'people', 'bills', 'events']:
+            self.jurisdiction_id = jurisdiction_id
+            self.jurisdiction_name = jurisdiction_id.rsplit(':', 1)[1].split('/')[0]
 
-                self.log_message('"{}" is not a valid endpoint'.format(endpoint), style='ERROR')
+            self.downloads_folder = os.path.join('downloads',
+                                                 self.jurisdiction_name)
 
-            else:
+            self.organizations_folder = os.path.join(self.downloads_folder, 'organizations')
+            self.posts_folder = os.path.join(self.downloads_folder, 'posts')
+            self.bills_folder = os.path.join(self.downloads_folder, 'bills')
+            self.people_folder = os.path.join(self.downloads_folder, 'people')
+            self.events_folder = os.path.join(self.downloads_folder, 'events')
 
-                download_only = options['download_only']
-                import_only = options['import_only']
+            self.create_jurisdiction()
+            self.create_legislative_sessions()
 
-                if not import_only and not download_only:
-                    download_only = True
-                    import_only = True
+            for endpoint in endpoints:
 
-                try:
-                    etl_method = getattr(self, '{}_etl'.format(endpoint))
-                    etl_method(import_only=import_only,
-                               download_only=download_only,
-                               delete=options['delete'])
+                if endpoint not in ['organizations', 'people', 'bills', 'events']:
 
-                except Exception as e:
-                    logger.error(e, exc_info=True)
+                    self.log_message('"{}" is not a valid endpoint'.format(endpoint), style='ERROR')
 
+                else:
 
-        if not options['no_index'] and getattr(settings, 'USING_NOTIFICATIONS', None):
-            from django.core import management
+                    download_only = options['download_only']
+                    import_only = options['import_only']
 
-            try:
-                management.call_command('update_index', age=24)
-            except Exception as e:
-                logger.error(e, exc_info=True)
+                    if not import_only and not download_only:
+                        download_only = True
+                        import_only = True
 
-            try:
-                management.call_command('send_notifications')
-            except Exception as e:
-                logger.error(e, exc_info=True)
+                    try:
+                        etl_method = getattr(self, '{}_etl'.format(endpoint))
+                        etl_method(import_only=import_only,
+                                   download_only=download_only,
+                                   delete=options['delete'])
 
+                    except Exception as e:
+                        client.captureException()
+                        logger.error(e, exc_info=True)
+
+        if not options['keep_downloads']:
+            shutil.rmtree(self.downloads_folder)
+            self.stdout.write('All files and folders cleared from {}'.format(self.downloads_folder))
 
     def log_message(self,
                     message,
@@ -259,7 +260,6 @@ class Command(BaseCommand):
                   download_only=False,
                   delete=False):
 
-        self.create_legislative_sessions()
 
         if download_only:
             self.log_message('Downloading bills ...',
@@ -271,6 +271,7 @@ class Command(BaseCommand):
             self.log_message('Importing bills ...',
                              center=True,
                              art_file='bills.txt')
+
             self.insert_raw_bills(delete=delete)
             self.insert_raw_actions(delete=delete)
 
@@ -283,14 +284,19 @@ class Command(BaseCommand):
             self.insert_raw_action_related_entity(delete=delete)
             self.insert_raw_sponsorships(delete=delete)
             self.insert_raw_billdocuments(delete=delete)
+            self.insert_raw_relatedbills(delete=delete)
 
             self.update_existing_action_related_entity()
             self.update_existing_sponsorships()
             self.update_existing_billdocuments()
+            self.update_existing_relatedbills()
 
             self.add_new_action_related_entity()
             self.add_new_sponsorships()
             self.add_new_billdocuments()
+            self.add_new_relatedbills()
+
+            self.insert_subjects()
 
         self.log_message('Bills Complete!', fancy=True, style='SUCCESS', center=True)
 
@@ -312,17 +318,19 @@ class Command(BaseCommand):
             self.insert_raw_events(delete=delete)
             self.insert_raw_eventparticipants(delete=delete)
             self.insert_raw_eventdocuments(delete=delete)
-            self.insert_raw_event_agenda_items(delete=delete)
+            self.insert_raw_eventmedia(delete=delete)
 
             self.update_existing_events()
             self.update_existing_eventparticipants()
             self.update_existing_eventdocuments()
-            self.update_existing_event_agenda_items()
+            self.update_existing_eventmedia()
 
             self.add_new_events()
             self.add_new_eventparticipants()
             self.add_new_eventdocuments()
-            self.add_new_event_agenda_items()
+            self.add_new_eventmedia()
+
+            self.insert_event_agenda_items()
 
         self.log_message('Events Complete!', fancy=True, style='SUCCESS', center=True)
 
@@ -336,31 +344,21 @@ class Command(BaseCommand):
         os.makedirs(self.organizations_folder, exist_ok=True)
         os.makedirs(self.posts_folder, exist_ok=True)
 
-        # first grab city council root
-        if hasattr(settings, 'OCD_CITY_COUNCIL_ID'):
-            self.grab_organization_posts({'id': settings.OCD_CITY_COUNCIL_ID})
-        else:
-            self.grab_organization_posts({'name': settings.OCD_CITY_COUNCIL_NAME})
-
-        orgs_url = '{}/organizations/?sort=updated_at&jurisdiction_id={}'.format(base_url, settings.OCD_JURISDICTION_ID)
-        r = session.get(orgs_url)
-
-        page_json = json.loads(r.text)
-
         org_counter = 0
         post_counter = 0
+        orgs_url = '{}/organizations/?sort=updated_at&jurisdiction_id={}'.format(base_url, self.jurisdiction_id)
+
+        r = self._get_response(orgs_url)
+        page_json = json.loads(r.text)
 
         for i in range(page_json['meta']['max_page']):
+            r = self._get_response(orgs_url + '&page=' + str(i + 1))
 
-            r = session.get(orgs_url + '&page=' + str(i + 1))
             page_json = json.loads(r.text)
-
             org_counter += len(page_json['results'])
 
             for result in page_json['results']:
-
                 post_count = self.grab_organization_posts({'id': result['id']})
-
                 post_counter += post_count
 
                 print('.', end='')
@@ -375,13 +373,12 @@ class Command(BaseCommand):
 
     def grab_organization_posts(self, org_dict):
         url = base_url + '/organizations/'
-
-        r = session.get(url, params=org_dict)
+        r = self._get_response(url, params=org_dict)
         page_json = json.loads(r.text)
         organization_ocd_id = page_json['results'][0]['id']
 
         url = base_url + '/' + organization_ocd_id + '/'
-        r = session.get(url)
+        r = self._get_response(url)
         page_json = json.loads(r.text)
 
         if page_json.get('error'):
@@ -439,15 +436,14 @@ class Command(BaseCommand):
 
     def grab_person_memberships(self, person_id):
         # this grabs a person and all their memberships
-
         url = base_url + '/' + person_id + '/'
-        r = session.get(url)
+        r = self._get_response(url)
         page_json = json.loads(r.text)
 
         # save image to disk
         if page_json['image']:
-            r = session.get(page_json['image'], verify=False)
-            if r.status_code == 200:
+            r = self._get_response(page_json['image'], verify=False, raise_error=False)
+            if r:
                 with open((settings.HEADSHOT_PATH + page_json['id'] + ".jpg"), 'wb') as f:
                     for chunk in r.iter_content(1000):
                         f.write(chunk)
@@ -470,10 +466,10 @@ class Command(BaseCommand):
 
         os.makedirs(self.bills_folder, exist_ok=True)
 
-        if hasattr(settings, 'OCD_CITY_COUNCIL_ID'):
-            query_params = {'from_organization__id': settings.OCD_CITY_COUNCIL_ID}
-        else:
-            query_params = {'from_organization__name': settings.OCD_CITY_COUNCIL_NAME}
+        organizations = session.get('{}/organizations/'.format(base_url),
+                                    params={'jurisdiction__id': self.jurisdiction_id})
+
+        organization_ids = [(o['id'], o['name']) for o in organizations.json()['results']]
 
         if self.update_since is None:
             max_updated = Bill.objects.all().aggregate(Max('ocd_updated_at'))['ocd_updated_at__max']
@@ -483,42 +479,53 @@ class Command(BaseCommand):
         else:
             max_updated = self.update_since
 
-        query_params['sort'] = 'updated_at'
-        query_params['updated_at__gte'] = max_updated.isoformat()
+        query_params = {
+            'sort': 'updated_at',
+            'updated_at__gte': max_updated.isoformat(),
+        }
 
         self.log_message('Getting bills since {}'.format(query_params['updated_at__gte']), style='NOTICE')
 
         search_url = '{}/bills/'.format(base_url)
-        search_results = session.get(search_url, params=query_params)
-        page_json = search_results.json()
 
         counter = 0
-        for page_num in range(page_json['meta']['max_page']):
 
-            query_params['page'] = int(page_num) + 1
-            result_page = session.get(search_url, params=query_params)
+        for organization_id, organization_name in organization_ids:
 
-            for result in result_page.json()['results']:
+            query_params['from_organization__id'] = organization_id
+            query_params['page'] = 1
 
-                bill_url = '{base}/{bill_id}/'.format(
-                    base=base_url, bill_id=result['id'])
-                bill_detail = session.get(bill_url)
+            self.log_message('Getting bills from {}'.format(organization_name), style='NOTICE')
 
-                bill_json = bill_detail.json()
-                ocd_uuid = bill_json['id'].split('/')[-1]
-                bill_filename = '{}.json'.format(ocd_uuid)
+            search_results = self._get_response(search_url, params=query_params)
+            page_json = search_results.json()
 
-                with open(os.path.join(self.bills_folder, bill_filename), 'w') as f:
-                    f.write(json.dumps(bill_json))
+            for page_num in range(page_json['meta']['max_page']):
 
-                counter += 1
+                query_params['page'] = int(page_num) + 1
+                result_page = self._get_response(search_url, params=query_params)
 
-                print('.', end='')
-                sys.stdout.flush()
+                for result in result_page.json()['results']:
 
-                if counter % 1000 == 0:
-                    print('\n')
-                    self.log_message('Downloaded {} bills'.format(counter))
+                    bill_url = '{base}/{bill_id}/'.format(
+                        base=base_url, bill_id=result['id'])
+                    bill_detail = self._get_response(bill_url)
+
+                    bill_json = bill_detail.json()
+                    ocd_uuid = bill_json['id'].split('/')[-1]
+                    bill_filename = '{}.json'.format(ocd_uuid)
+
+                    with open(os.path.join(self.bills_folder, bill_filename), 'w') as f:
+                        f.write(json.dumps(bill_json))
+
+                    counter += 1
+
+                    print('.', end='')
+                    sys.stdout.flush()
+
+                    if counter % 1000 == 0:
+                        print('\n')
+                        self.log_message('Downloaded {} bills'.format(counter))
 
         self.log_message('Downloaded {} bills'.format(counter), fancy=True)
 
@@ -528,7 +535,7 @@ class Command(BaseCommand):
 
         events_url = '{0}/events/'.format(base_url)
 
-        params = {'jurisdiction_id': settings.OCD_JURISDICTION_ID}
+        params = {'jurisdiction_id': self.jurisdiction_id}
 
         if self.update_since is None:
             max_updated = Event.objects.all().aggregate(
@@ -542,14 +549,14 @@ class Command(BaseCommand):
         params['updated_at__gte'] = max_updated.isoformat()
         params['sort'] = 'updated_at'
 
-        r = session.get(events_url, params=params)
+        r = self._get_response(events_url, params=params)
         page_json = json.loads(r.text)
 
         counter = 0
         for i in range(page_json['meta']['max_page']):
 
             params['page'] = str(i + 1)
-            r = session.get(events_url, params=params)
+            r = self._get_response(events_url, params=params)
             page_json = json.loads(r.text)
 
             for event in page_json['results']:
@@ -558,7 +565,7 @@ class Command(BaseCommand):
                 event_filename = '{}.json'.format(ocd_uuid)
 
                 event_url = base_url + '/' + event['id'] + '/'
-                r = session.get(event_url)
+                r = self._get_response(event_url)
 
                 if r.status_code == 200:
                     page_json = json.loads(r.text)
@@ -620,16 +627,46 @@ class Command(BaseCommand):
                 ALTER COLUMN updated_at SET DEFAULT NOW()
             '''.format(entity_type))
 
+    def create_jurisdiction(self):
+
+        url = '{0}/jurisdictions/?id={1}'.format(base_url, self.jurisdiction_id)
+
+        r = self._get_response(url)
+        jurisdiction_info = json.loads(r.text)['results'][0]
+
+        try:
+            jurisdiction = Jurisdiction.objects.get(ocd_id=jurisdiction_info['id'])
+            self.log_message('Skipped creating jurisdiction {}'.format(jurisdiction_info['name']),
+                             style='SUCCESS')
+        except Jurisdiction.DoesNotExist:
+            jurisdiction = Jurisdiction(ocd_id=jurisdiction_info['id'],
+                                        name=jurisdiction_info['name'],
+                                        classification=jurisdiction_info['classification'],
+                                        url=jurisdiction_info['url'])
+            jurisdiction.save()
+
+            self.log_message('Created jurisdiction {}'.format(jurisdiction_info['name']),
+                             style='SUCCESS')
+
+
     def create_legislative_sessions(self):
         session_ids = []
 
         if hasattr(settings, 'LEGISLATIVE_SESSIONS') and settings.LEGISLATIVE_SESSIONS:
             session_ids = settings.LEGISLATIVE_SESSIONS
+
+            # for more than one jurisdiction, LEGISLATIVE_SESSIONS will be
+            # a dict where the keys are jurisdiction ids and the values are
+            # lists of legislative sessions
+
+            if isinstance(session_ids, dict):
+                session_ids = session_ids[self.jurisdiction_id]
+
         else:
-            url = base_url + '/' + settings.OCD_JURISDICTION_ID + '/'
-            r = session.get(url)
+            url = base_url + '/' + self.jurisdiction_id + '/'
+            r = self._get_response(url)
             page_json = json.loads(r.text)
-            session_ids = [session['identifier']
+            session_ids = ['{0}-{1}'.format(session['identifier'], self.jurisdiction_name)
                            for session in page_json['legislative_sessions']]
 
         # Sort so most recent session last
@@ -637,7 +674,7 @@ class Command(BaseCommand):
         for leg_session in session_ids:
             obj, created = LegislativeSession.objects.get_or_create(
                 identifier=leg_session,
-                jurisdiction_ocd_id=settings.OCD_JURISDICTION_ID,
+                jurisdiction_ocd_id=self.jurisdiction_id,
                 name='%s Legislative Session' % leg_session,
             )
             if created and DEBUG:
@@ -656,14 +693,16 @@ class Command(BaseCommand):
                 classification,
                 source_url,
                 slug,
-                parent_id
+                parent_id,
+                jurisdiction_id
             ) VALUES (
                 :ocd_id,
                 :name,
                 :classification,
                 :source_url,
                 :slug,
-                :parent_id
+                :parent_id,
+                :jurisdiction_id
             )
             '''
 
@@ -690,6 +729,7 @@ class Command(BaseCommand):
                 'source_url': source_url,
                 'slug': slug,
                 'parent_id': parent_ocd_id,
+                'jurisdiction_id': self.jurisdiction_id,
             }
 
             inserts.append(insert)
@@ -822,6 +862,7 @@ class Command(BaseCommand):
                 role,
                 start_date,
                 end_date,
+                extras,
                 organization_id,
                 person_id,
                 post_id
@@ -830,6 +871,7 @@ class Command(BaseCommand):
                 :role,
                 :start_date,
                 :end_date,
+                :extras,
                 :organization_id,
                 :person_id,
                 :post_id
@@ -842,9 +884,7 @@ class Command(BaseCommand):
                 person_info = json.loads(f.read())
 
             for membership_json in person_info['memberships']:
-
                 end_date = parse_date(membership_json['end_date'])
-
                 start_date = parse_date(membership_json['start_date'])
 
                 post_id = None
@@ -856,6 +896,7 @@ class Command(BaseCommand):
                     'role': membership_json['role'],
                     'start_date': start_date,
                     'end_date': end_date,
+                    'extras': json.dumps(membership_json['extras']),
                     'organization_id': membership_json['organization']['id'],
                     'person_id': person_info['id'],
                     'post_id': post_id,
@@ -889,11 +930,12 @@ class Command(BaseCommand):
                 from_organization_id,
                 full_text,
                 ocr_full_text,
+                html_text,
                 abstract,
                 legislative_session_id,
                 bill_type,
-                subject,
-                slug
+                slug,
+                restrict_view
             ) VALUES (
                 :ocd_id,
                 :ocd_created_at,
@@ -906,11 +948,12 @@ class Command(BaseCommand):
                 :from_organization_id,
                 :full_text,
                 :ocr_full_text,
+                :html_text,
                 :abstract,
                 :legislative_session_id,
                 :bill_type,
-                :subject,
-                :slug
+                :slug,
+                :restrict_view
             )
             '''
 
@@ -921,21 +964,31 @@ class Command(BaseCommand):
             with open(os.path.join(self.bills_folder, bill_json)) as f:
                 bill_info = json.loads(f.read())
 
+
+            # Add the web source, if available. 
+            # Otherwise, assume that the 'api' source is available and add that.
             source_url = None
+            source_note = None
             for source in bill_info['sources']:
                 if source['note'] == 'web':
                     source_url = source['url']
+                    source_note = source['note']
+                    break
+                else:
+                    source_url = source['url']
+                    source_note = source['note']
 
             full_text = None
-            if 'full_text' in bill_info['extras']:
-                full_text = bill_info['extras']['full_text']
+            if 'rtf_text' in bill_info['extras']:
+                full_text = bill_info['extras']['rtf_text']
 
             ocr_full_text = None
-            if 'ocr_full_text' in bill_info['extras']:
-                ocr_full_text = bill_info['extras']['ocr_full_text']
-
-            elif 'plain_text' in bill_info['extras']:
+            if 'plain_text' in bill_info['extras']:
                 ocr_full_text = bill_info['extras']['plain_text']
+
+            html_text = None
+            if 'html_text' in bill_info['extras']:
+                html_text = bill_info['extras']['html_text']
 
             abstract = None
             if bill_info['abstracts']:
@@ -950,11 +1003,11 @@ class Command(BaseCommand):
             else:
                 raise Exception(bill_info['classification'])
 
-            subject = None
-            if 'subject' in bill_info and bill_info['subject']:
-                subject = bill_info['subject'][0]
-
             slug = slugify(bill_info['identifier'])
+
+            restrict_view = False
+            if bill_info['extras'].get('restrict_view'):
+                restrict_view = bill_info['extras']['restrict_view']
 
             insert = {
                 'ocd_id': bill_info['id'],
@@ -964,15 +1017,16 @@ class Command(BaseCommand):
                 'identifier': bill_info['identifier'],
                 'classification': bill_info['classification'][0],
                 'source_url': source_url,
-                'source_note': bill_info['sources'][0]['note'],
+                'source_note': source_note,
                 'from_organization_id': bill_info['from_organization']['id'],
                 'full_text': full_text,
                 'ocr_full_text': ocr_full_text,
+                'html_text': html_text,
                 'abstract': abstract,
                 'legislative_session_id': bill_info['legislative_session']['identifier'],
                 'bill_type': bill_type,
-                'subject': subject,
                 'slug': slug,
+                'restrict_view': restrict_view,
             }
 
             inserts.append(insert)
@@ -1031,7 +1085,7 @@ class Command(BaseCommand):
                 if action['classification']:
                     classification = action['classification'][0]
 
-                action_date = app_timezone.localize(date_parser.parse(action['date']))
+                action_date = date_parser.parse(action['date']).date()
 
                 insert = {
                     'date': action_date,
@@ -1319,6 +1373,55 @@ class Command(BaseCommand):
 
         self.log_message('Inserted {0} raw bill attachments and versions\n'.format(counter), style='SUCCESS')
 
+    def insert_raw_relatedbills(self, delete=False):
+        pk_cols = ['related_bill_identifier', 'central_bill_id']
+
+        self.setup_raw('relatedbill',
+                       delete=delete,
+                       updated_at=False,
+                       pk_cols=pk_cols)
+
+        inserts = []
+
+        insert_query = '''
+            INSERT INTO raw_relatedbill (
+                related_bill_identifier,
+                central_bill_id
+            ) VALUES (
+                :related_bill_identifier,
+                :central_bill_id
+            )
+        '''
+
+        counter = 0
+        for bill_json in os.listdir(self.bills_folder):
+
+            with open(os.path.join(self.bills_folder, bill_json)) as f:
+                bill_info = json.loads(f.read())
+
+            if 'related_bills' in bill_info and bill_info['related_bills']:
+                for related_bill in bill_info['related_bills']:
+                    insert = {
+                        'related_bill_identifier': related_bill['identifier'],
+                        'central_bill_id': bill_info['id'],
+                    }
+
+                    inserts.append(insert)
+
+                if inserts and len(inserts) % 10000 == 0:
+                    self.executeTransaction(sa.text(insert_query), *inserts)
+
+                    counter += 10000
+
+                    self.log_message('Inserted {} raw related bills'.format(counter))
+
+                    inserts = []
+
+        if inserts:
+            self.executeTransaction(sa.text(insert_query), *inserts)
+            counter += len(inserts)
+
+        self.log_message('Inserted {0} raw related bills\n'.format(counter), style='SUCCESS')
 
     def insert_raw_events(self, delete=False):
         self.setup_raw('event', delete=delete)
@@ -1339,10 +1442,10 @@ class Command(BaseCommand):
                 status,
                 location_name,
                 location_url,
-                media_url,
                 source_url,
                 source_note,
-                slug
+                slug,
+                extras
             ) VALUES (
                 :ocd_id,
                 :ocd_created_at,
@@ -1356,10 +1459,10 @@ class Command(BaseCommand):
                 :status,
                 :location_name,
                 :location_url,
-                :media_url,
                 :source_url,
                 :source_note,
-                :slug
+                :slug,
+                :extras
             )
         '''
 
@@ -1396,10 +1499,10 @@ class Command(BaseCommand):
                 'status': event_info['status'],
                 'location_name': event_info['location']['name'],
                 'location_url': event_info['location']['url'],
-                'media_url': event_info['media'][0]['links'][0]['url'] if event_info['media'] else None,
                 'source_url': source_url,
                 'source_note': event_info['sources'][0]['note'],
                 'slug': slug,
+                'extras': json.dumps(event_info['extras']),
             }
 
             inserts.append(insert)
@@ -1534,85 +1637,66 @@ class Command(BaseCommand):
 
         self.log_message('Inserted {0} event documents\n'.format(counter), style='SUCCESS')
 
-    def insert_raw_event_agenda_items(self, delete=False):
-        pk_cols = ['event_id', '"order"']
+    def insert_raw_eventmedia(self, delete=False):
+        pk_cols = ['event_id', 'url']
 
-        self.setup_raw('eventagendaitem',
+        self.setup_raw('eventmedia',
                        delete=delete,
-                       pk_cols=pk_cols)
+                       pk_cols=pk_cols,
+                       updated_at=True)
+
+        self.executeTransaction('''
+                ALTER TABLE raw_eventmedia
+                ALTER COLUMN updated_at SET DEFAULT NOW()
+            ''')
 
         inserts = []
 
         insert_query = '''
-            INSERT INTO raw_eventagendaitem (
-                "order",
-                description,
+            INSERT INTO raw_eventmedia (
                 event_id,
-                bill_id,
                 note,
-                notes
+                url
             ) VALUES (
-                :order,
-                :description,
                 :event_id,
-                :bill_id,
                 :note,
-                :notes
+                :url
             )
             '''
 
         counter = 0
-
         for event_json in os.listdir(self.events_folder):
 
             with open(os.path.join(self.events_folder, event_json)) as f:
                 event_info = json.loads(f.read())
 
-            for item in event_info['agenda']:
+            for media in event_info['media']:
 
-                bill_id = None
-                note = None
+                for link in media['links']:
 
-                try:
-                    related_entity = item['related_entities'][0]
+                    insert = {
+                        'event_id': event_info['id'],
+                        'note': media['note'],
+                        'url': link['url'],
+                    }
 
-                    # Only capture related entities when they are bills
-                    if related_entity['entity_type'] == 'bill':
-                        bill_id = related_entity['entity_id']
-                        note = related_entity['note']
+                    inserts.append(insert)
 
-                except IndexError:
-                    pass
+                    if inserts and len(inserts) % 10000 == 0:
+                        self.executeTransaction(sa.text(insert_query), *inserts)
 
-                notes = ''
-                if item['notes']:
-                    notes = item['notes'][0]
+                        counter += 10000
 
-                insert = {
-                    'order': item['order'],
-                    'description': item['description'],
-                    'event_id': event_info['id'],
-                    'bill_id': bill_id,
-                    'note': note,
-                    'notes': notes,
-                }
+                        self.log_message('Inserted {} raw event media'.format(counter))
 
-                inserts.append(insert)
-                if inserts and len(inserts) % 10000 == 0:
-                    self.executeTransaction(sa.text(insert_query), *inserts)
-
-                    counter += 10000
-
-                    self.log_message('Inserted {} raw event agenda items'.format(counter))
-
-                    inserts = []
+                        inserts = []
 
         if inserts:
             self.executeTransaction(sa.text(insert_query), *inserts)
 
             counter += len(inserts)
 
-        self.log_message('Inserted {0} raw event agenda items\n'.format(counter), style='SUCCESS')
+        self.log_message('Inserted {0} event media\n'.format(counter), style='SUCCESS')
 
     ################################
     ###                          ###
@@ -1699,6 +1783,7 @@ class Command(BaseCommand):
             'classification',
             'source_url',
             'parent_id',
+            'jurisdiction_id',
             'slug'
         ]
 
@@ -1738,7 +1823,8 @@ class Command(BaseCommand):
                 person_id VARCHAR,
                 post_id VARCHAR,
                 start_date DATE,
-                end_date DATE
+                end_date DATE,
+                extras JSONB
             )
         ''')
 
@@ -1747,6 +1833,7 @@ class Command(BaseCommand):
            'role',
            'start_date',
            'end_date',
+           'extras',
            'organization_id',
            'person_id',
            'post_id'
@@ -1761,7 +1848,8 @@ class Command(BaseCommand):
                 raw.person_id,
                 raw.post_id,
                 raw.start_date,
-                raw.end_date
+                raw.end_date,
+                raw.extras
               FROM raw_membership AS raw
               JOIN councilmatic_core_membership AS dat
                 ON (raw.organization_id = dat.organization_id
@@ -1812,14 +1900,15 @@ class Command(BaseCommand):
             'classification',
             'source_url',
             'source_note',
-            'subject',
             'from_organization_id',
             'full_text',
             'ocr_full_text',
+            'html_text',
             'abstract',
             'last_action_date',
             'legislative_session_id',
             'slug',
+            'restrict_view',
         ]
         self.update_entity_type('bill', cols=cols)
 
@@ -2061,6 +2150,57 @@ class Command(BaseCommand):
 
         self.log_message('Found {0} changed bill documents'.format(change_count), style='SUCCESS')
 
+    def update_existing_relatedbills(self):
+        self.executeTransaction('DROP TABLE IF EXISTS change_relatedbill')
+        self.executeTransaction('''
+            CREATE TABLE change_relatedbill (
+                related_bill_identifier VARCHAR,
+                central_bill_id VARCHAR
+            )
+        ''')
+
+        cols = [
+            'related_bill_identifier',
+            'central_bill_id',
+        ]
+
+        where_clause, set_values, fields = self.get_update_parts(cols, [])
+
+        find_changes = '''
+            INSERT INTO change_relatedbill
+              SELECT
+                raw.related_bill_identifier,
+                raw.central_bill_id
+              FROM raw_relatedbill AS raw
+              JOIN councilmatic_core_relatedbill AS dat
+                ON (raw.related_bill_identifier = dat.related_bill_identifier
+                    AND raw.central_bill_id = dat.central_bill_id)
+              WHERE {}
+        '''.format(where_clause)
+
+        update_dat = '''
+            UPDATE councilmatic_core_relatedbill SET
+              {set_values}
+            FROM (
+              SELECT
+                {fields}
+              FROM raw_relatedbill AS raw
+              JOIN change_relatedbill AS change
+                ON (raw.related_bill_identifier = change.related_bill_identifier
+                    AND raw.central_bill_id = change.central_bill_id)
+            ) AS s
+            WHERE councilmatic_core_relatedbill.related_bill_identifier = s.related_bill_identifier
+              AND councilmatic_core_relatedbill.central_bill_id = s.central_bill_id
+        '''.format(set_values=set_values,
+                   fields=fields)
+
+        self.executeTransaction(find_changes)
+        self.executeTransaction(update_dat)
+
+        change_count = self.connection.execute('select count(*) from change_relatedbill').first().count
+
+        self.log_message('Found {0} changed related bills'.format(change_count), style='SUCCESS')
+
     def update_existing_events(self):
         cols = [
             'ocd_id',
@@ -2075,10 +2215,10 @@ class Command(BaseCommand):
             'status',
             'location_name',
             'location_url',
-            'media_url',
             'source_url',
             'source_note',
             'slug',
+            'extras',
         ]
         self.update_entity_type('event', cols=cols)
 
@@ -2193,60 +2333,57 @@ class Command(BaseCommand):
 
         self.log_message('Found {0} changed event documents'.format(change_count), style='SUCCESS')
 
-    def update_existing_event_agenda_items(self):
-        self.executeTransaction('DROP TABLE IF EXISTS change_eventagendaitem')
+    def update_existing_eventmedia(self):
+        self.executeTransaction('DROP TABLE IF EXISTS change_eventmedia')
         self.executeTransaction('''
-            CREATE TABLE change_eventagendaitem (
+            CREATE TABLE change_eventmedia (
                 event_id VARCHAR,
-                "order" INTEGER
+                url VARCHAR
             )
         ''')
 
         cols = [
-            'order',
-            'description',
             'event_id',
-            'bill_id',
-            'note',
-            'notes',
+            'url',
+            'note'
         ]
 
-        where_clause, set_values, fields = self.get_update_parts(cols, ['updated_at'])
+        where_clause, set_values, fields = self.get_update_parts(cols, [])
 
         find_changes = '''
-            INSERT INTO change_eventagendaitem
+            INSERT INTO change_eventmedia
               SELECT
                 raw.event_id,
-                raw."order"
-              FROM raw_eventagendaitem AS raw
-              JOIN councilmatic_core_eventagendaitem AS dat
+                raw.url
+              FROM raw_eventmedia AS raw
+              JOIN councilmatic_core_eventmedia AS dat
                 ON (raw.event_id = dat.event_id
-                    AND raw."order" = dat."order")
+                    AND raw.url = dat.url)
               WHERE {}
         '''.format(where_clause)
 
         update_dat = '''
-            UPDATE councilmatic_core_eventagendaitem SET
+            UPDATE councilmatic_core_eventmedia SET
               {set_values}
             FROM (
               SELECT
                 {fields}
-              FROM raw_eventagendaitem AS raw
-              JOIN change_eventagendaitem AS change
+              FROM raw_eventmedia AS raw
+              JOIN change_eventmedia AS change
                 ON (raw.event_id = change.event_id
-                    AND raw."order" = change."order")
+                    AND raw.url = change.url)
             ) AS s
-            WHERE councilmatic_core_eventagendaitem.event_id = s.event_id
-              AND councilmatic_core_eventagendaitem."order" = s."order"
+            WHERE councilmatic_core_eventmedia.event_id = s.event_id
+              AND councilmatic_core_eventmedia.url = s.url
         '''.format(set_values=set_values,
                    fields=fields)
 
         self.executeTransaction(find_changes)
         self.executeTransaction(update_dat)
 
-        change_count = self.connection.execute('select count(*) from change_eventagendaitem').first().count
+        change_count = self.connection.execute('select count(*) from change_eventmedia').first().count
 
-        self.log_message('Found {0} changed event agenda items'.format(change_count), style='SUCCESS')
+        self.log_message('Found {0} changed event media'.format(change_count), style='SUCCESS')
 
     ########################
     ###                  ###
@@ -2304,6 +2441,7 @@ class Command(BaseCommand):
             'classification',
             'source_url',
             'parent_id',
+            'jurisdiction_id',
             'slug',
         ]
 
@@ -2342,7 +2480,8 @@ class Command(BaseCommand):
                 person_id VARCHAR,
                 post_id VARCHAR,
                 start_date DATE,
-                end_date DATE
+                end_date DATE,
+                extras JSONB
             )
         ''')
 
@@ -2353,7 +2492,8 @@ class Command(BaseCommand):
                 raw.person_id,
                 raw.post_id,
                 raw.start_date,
-                raw.end_date
+                raw.end_date,
+                raw.extras
               FROM raw_membership AS raw
               LEFT JOIN councilmatic_core_membership AS dat
                 ON (raw.organization_id = dat.organization_id
@@ -2373,6 +2513,7 @@ class Command(BaseCommand):
            'role',
            'start_date',
            'end_date',
+           'extras',
            'organization_id',
            'person_id',
            'post_id',
@@ -2414,14 +2555,15 @@ class Command(BaseCommand):
             'classification',
             'source_url',
             'source_note',
-            'subject',
             'from_organization_id',
             'full_text',
             'ocr_full_text',
+            'html_text',
             'abstract',
             'last_action_date',
             'legislative_session_id',
             'slug',
+            'restrict_view',
         ]
 
         self.add_entity_type('bill', cols=cols)
@@ -2477,9 +2619,26 @@ class Command(BaseCommand):
 
         self.executeTransaction(insert_new)
 
-        new_count = self.connection.execute('select count(*) from new_action').first().count
+        # At this point, the database has bills and actions related to those bills.
+        # Create last_action_date for bills.
+        insert_last_action_date = '''
+        UPDATE councilmatic_core_bill
+        SET last_action_date = s.last_action_date
+        FROM (
+            SELECT (array_agg(action.date order by action.date desc))[1] as last_action_date, bill.ocd_id
+            FROM councilmatic_core_action AS action
+            JOIN councilmatic_core_bill AS bill
+            ON action.bill_id=bill.ocd_id
+            GROUP BY bill.ocd_id
+            ) AS s
+        WHERE councilmatic_core_bill.ocd_id = s.ocd_id
+        '''
 
+        self.executeTransaction(insert_last_action_date)
+
+        new_count = self.connection.execute('select count(*) from new_action').first().count
         self.log_message('Found {0} new action'.format(new_count), style='SUCCESS')
+
 
     def add_new_action_related_entity(self):
         self.executeTransaction('DROP TABLE IF EXISTS new_actionrelatedentity')
@@ -2658,6 +2817,109 @@ class Command(BaseCommand):
 
         self.log_message('Found {0} new bill documents'.format(new_count), style='SUCCESS')
 
+    def insert_subjects(self):
+        delete_statement = '''
+            DELETE FROM councilmatic_core_subject
+            WHERE bill_id = '{}'
+        '''
+
+        insert_query = '''
+            INSERT INTO councilmatic_core_subject (
+              bill_id,
+              subject
+            ) VALUES (
+              :bill_id,
+              :subject
+            )
+        '''
+
+        counter = 0
+        inserts = []
+
+        for bill_json in os.listdir(self.bills_folder):
+
+            with open(os.path.join(self.bills_folder, bill_json)) as f:
+                bill_info = json.loads(f.read())
+
+            bill_id = bill_info['id']
+
+            self.executeTransaction(delete_statement.format(bill_id))
+
+            if 'subject' in bill_info and bill_info['subject']:
+                for subject in bill_info['subject']:
+                    insert = {
+                        'subject': subject,
+                        'bill_id': bill_id,
+                    }
+
+                    inserts.append(insert)
+
+                if inserts and len(inserts) % 10000 == 0:
+                    self.executeTransaction(sa.text(insert_query), *inserts)
+
+                    counter += 10000
+
+                    self.log_message('Inserted {} bill subjects'.format(counter))
+
+                    inserts = []
+
+        if inserts:
+            self.executeTransaction(sa.text(insert_query), *inserts)
+            counter += len(inserts)
+
+        self.log_message('Added {0} bill subjects'.format(counter), style='SUCCESS')
+
+    def add_new_relatedbills(self):
+        self.executeTransaction('DROP TABLE IF EXISTS new_relatedbill')
+        self.executeTransaction('''
+            CREATE TABLE new_relatedbill (
+                related_bill_identifier VARCHAR,
+                central_bill_id VARCHAR
+            )
+        ''')
+
+        cols = [
+            'related_bill_identifier',
+            'central_bill_id',
+        ]
+
+        find_new = '''
+            INSERT INTO new_relatedbill
+              SELECT
+                raw.related_bill_identifier,
+                raw.central_bill_id
+              FROM raw_relatedbill AS raw
+              LEFT JOIN councilmatic_core_relatedbill AS dat
+                ON (raw.related_bill_identifier = dat.related_bill_identifier
+                    AND raw.central_bill_id = dat.central_bill_id)
+              WHERE dat.related_bill_identifier IS NULL
+                    AND dat.central_bill_id IS NULL
+        '''
+
+        self.executeTransaction(find_new)
+
+        insert_fields = ', '.join(c for c in cols)
+        select_fields = ', '.join('raw.{}'.format(c) for c in cols)
+
+        insert_new = '''
+            INSERT INTO councilmatic_core_relatedbill (
+              {insert_fields}
+            )
+              SELECT {select_fields}
+              FROM raw_relatedbill AS raw
+              JOIN new_relatedbill AS new
+                ON (raw.related_bill_identifier = new.related_bill_identifier
+                    AND raw.central_bill_id = new.central_bill_id)
+        '''.format(insert_fields=insert_fields,
+                   select_fields=select_fields)
+
+        self.executeTransaction(insert_new)
+
+        new_count = self.connection.execute('select count(*) from new_relatedbill').first().count
+
+        self.log_message('Found {0} new related bills'.format(new_count), style='SUCCESS')
+
+
     def add_new_events(self):
         cols = [
             'ocd_id',
@@ -2672,10 +2934,10 @@ class Command(BaseCommand):
             'status',
             'location_name',
             'location_url',
-            'media_url',
             'source_url',
             'source_note',
             'slug',
+            'extras',
         ]
 
         self.add_entity_type('event', cols=cols)
@@ -2789,59 +3051,147 @@ class Command(BaseCommand):
 
         self.log_message('Found {0} new event documents'.format(new_count), style='SUCCESS')
 
-    def add_new_event_agenda_items(self):
-        self.executeTransaction('DROP TABLE IF EXISTS new_eventagendaitem')
+    def add_new_eventmedia(self):
+        self.executeTransaction('DROP TABLE IF EXISTS new_eventmedia')
         self.executeTransaction('''
-            CREATE TABLE new_eventagendaitem (
+            CREATE TABLE new_eventmedia (
                 event_id VARCHAR,
-                "order" INTEGER
+                url VARCHAR
             )
         ''')
 
         cols = [
-            'order',
-            'description',
             'event_id',
-            'bill_id',
-            'note',
-            'notes',
+            'url',
+            'note'
         ]
 
         find_new = '''
-            INSERT INTO new_eventagendaitem
+            INSERT INTO new_eventmedia
               SELECT
                 raw.event_id,
-                raw."order"
-              FROM raw_eventagendaitem AS raw
-              LEFT JOIN councilmatic_core_eventagendaitem AS dat
+                raw.url
+              FROM raw_eventmedia AS raw
+              LEFT JOIN councilmatic_core_eventmedia AS dat
                 ON (raw.event_id = dat.event_id
-                    AND raw."order" = dat."order")
+                    AND raw.url = dat.url)
               WHERE dat.event_id IS NULL
-                    AND dat."order" IS NULL
+                    AND dat.url IS NULL
         '''
 
         self.executeTransaction(find_new)
 
-        insert_fields = ', '.join('"{}"'.format(c) for c in cols)
-        select_fields = ', '.join('raw."{}"'.format(c) for c in cols)
+        insert_fields = ', '.join(c for c in cols)
+        select_fields = ', '.join('raw.{}'.format(c) for c in cols)
 
         insert_new = '''
-            INSERT INTO councilmatic_core_eventagendaitem (
+            INSERT INTO councilmatic_core_eventmedia (
               {insert_fields}, updated_at
             )
               SELECT {select_fields}, updated_at
-              FROM raw_eventagendaitem AS raw
-              JOIN new_eventagendaitem AS new
+              FROM raw_eventmedia AS raw
+              JOIN new_eventmedia AS new
                 ON (raw.event_id = new.event_id
-                    AND raw."order" = new."order")
+                    AND raw.url = new.url)
         '''.format(insert_fields=insert_fields,
                    select_fields=select_fields)
 
         self.executeTransaction(insert_new)
-        new_count = self.connection.execute('select count(*) from new_eventagendaitem').first().count
 
-        self.log_message('Found {0} new event agenda items'.format(new_count), style='SUCCESS')
+        new_count = self.connection.execute('select count(*) from new_eventmedia').first().count
 
+        self.log_message('Found {0} new event media'.format(new_count), style='SUCCESS')
+
+    def insert_event_agenda_items(self):
+        inserts = []
+
+        # We do not want to import redundant or obsolete event agenda items: before importing new items, delete existing ones (with the specified ocd_id).
+        delete_statement = '''
+            DELETE FROM councilmatic_core_eventagendaitem
+            WHERE event_id in ({})
+        '''
+
+        insert_query = '''
+            INSERT INTO councilmatic_core_eventagendaitem (
+                "order",
+                description,
+                event_id,
+                bill_id,
+                note,
+                notes,
+                updated_at,
+                plain_text
+            ) VALUES (
+                :order,
+                :description,
+                :event_id,
+                :bill_id,
+                :note,
+                :notes,
+                :updated_at,
+                :plain_text
+            )
+            '''
+
+        event_ids = []
+        counter = 0
+
+        for event_json in os.listdir(self.events_folder):
+
+            with open(os.path.join(self.events_folder, event_json)) as f:
+                event_info = json.loads(f.read())
+
+            ocd_id = event_info['id']
+            event_ids.append(ocd_id)
+
+            for item in event_info['agenda']:
+
+                bill_id = None
+                note = None
+                notes = ''
+
+                if item['notes']:
+                    notes = item['notes'][0]
+
+                if item['extras'].get('plain_text'):
+                    plain_text = item['extras']['plain_text']
+                else:
+                    plain_text = None
+
+                # Add all items!
+                insert = {
+                    'order': item['order'],
+                    'description': item['description'],
+                    'event_id': event_info['id'],
+                    'bill_id': bill_id,
+                    'note': note,
+                    'notes': notes,
+                    'updated_at': event_info['updated_at'],
+                    'plain_text': plain_text
+                }
+
+                related_bill_entities = [i for i in item['related_entities']
+                                         if i['entity_type'] == 'bill']
+
+                if related_bill_entities:
+
+                    for related_bill in related_bill_entities:
+                        insert['bill_id'] = related_bill['entity_id']
+                        insert['note'] = related_bill['note']
+
+                        inserts.append(insert)
+
+                else:
+                    inserts.append(insert)
+
+        if inserts:
+            queries_list = [delete_statement.format(','.join(["'{}'".format(e) for e in event_ids])), sa.text(insert_query)]
+            params_list = [[], inserts]
+            self.executeTransactionList(queries_list, params_list)
+
+            counter += len(inserts)
+
+        self.log_message('Added {0} event agenda items\n'.format(counter), style='SUCCESS')
 
     def populate_council_district_shapes(self):
 
@@ -2849,45 +3199,63 @@ class Command(BaseCommand):
         # grab boundary listing
         for boundary in settings.BOUNDARY_SET:
             bndry_set_url = bndry_base_url + '/boundaries/' + boundary
-            r = session.get(bndry_set_url + '/?limit=0')
+
+            r = self._get_response(bndry_set_url + '/?limit=0')
             page_json = json.loads(r.text)
 
             # loop through boundary listing
             for bndry_json in page_json['objects']:
                 # grab boundary shape
                 shape_url = bndry_base_url + bndry_json['url'] + 'shape'
-                r = session.get(shape_url)
+                r = self._get_response(shape_url, raise_error=False)
                 # update the right post(s) with the shape
-                if 'ocd-division' in bndry_json['external_id']:
-                    division_ocd_id = bndry_json['external_id']
+                if r:
+                    if 'ocd-division' in bndry_json['external_id']:
+                        division_ocd_id = bndry_json['external_id']
 
-                    Post.objects.filter(
-                        division_ocd_id=division_ocd_id).update(shape=r.text)
-                else:
-                    # Represent API doesn't use OCD id as external_id,
-                    # so we must work around that
-                    division_ocd_id_fragment = ':' + bndry_json['external_id']
-                    Post.objects.filter(
-                        division_ocd_id__endswith=division_ocd_id_fragment).update(shape=r.text)
+                        Post.objects.filter(
+                            division_ocd_id=division_ocd_id).update(shape=r.text)
+                    else:
+                        # Represent API doesn't use OCD id as external_id,
+                        # so we must work around that
+                        division_ocd_id_fragment = ':' + bndry_json['external_id']
+                        Post.objects.filter(
+                            division_ocd_id__endswith=division_ocd_id_fragment).update(shape=r.text)
 
-                print('.', end='')
-                sys.stdout.flush()
+                    print('.', end='')
+                    sys.stdout.flush()
 
     def executeTransaction(self, query, *args, **kwargs):
-        trans = self.connection.begin()
+        with self.connection.begin() as trans:
+            try:
+                self.connection.execute("SET local timezone to '{}'".format(settings.TIME_ZONE))
+                if kwargs:
+                    self.connection.execute(query, **kwargs)
+                else:
+                    self.connection.execute(query, *args)
+            except:
+                client.captureException()
+                raise
 
-        raise_exc = kwargs.get('raise_exc', True)
-
-        try:
+    # Call this function when consolidating multiple queries into a single transaction!
+    # This function iterates over a list of queries and a list of params, and executes those queries.
+    # It, then, tries to commit the results of the execution and rolls back, if unable to do so.
+    def executeTransactionList(self, query_list, args_list):
+        with self.connection.begin() as trans:
             self.connection.execute("SET local timezone to '{}'".format(settings.TIME_ZONE))
-            if kwargs:
-                self.connection.execute(query, **kwargs)
-            else:
+
+            for query, args in zip(query_list, args_list):
                 self.connection.execute(query, *args)
-            trans.commit()
-        except sa.exc.ProgrammingError as e:
-            # TODO: Make some kind of logger
-            # logger.error(e, exc_info=True)
-            trans.rollback()
-            if raise_exc:
-                raise e
+
+    # OCD API has intermittently thrown 502 and 504 errors; only proceed when receiving an 'ok' status.
+    def _get_response(self, url, params=None, timeout=60, raise_error=True, **kwargs):
+        response = session.get(url, params=params, timeout=timeout, **kwargs)
+
+        if response.ok:
+            return response
+        message = '{url} returned a bad response - {status}'.format(url=url, status=response.status_code)
+        if not raise_error:
+            self.log_message('WARNING: {0}'.format(message), style='ERROR')
+            return None
+
+        raise requests.exceptions.HTTPError('ERROR: {0}'.format(message))
